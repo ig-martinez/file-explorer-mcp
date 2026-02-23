@@ -1,0 +1,293 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# File Explorer MCP Server — stdio transport
+# Reads JSON-RPC 2.0 messages from stdin (one per line), writes responses to stdout.
+# No Rails or external gems required.
+
+require "json"
+
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME      = "file-explorer-mcp"
+SERVER_VERSION   = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Tools definition
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+  {
+    name: "read_file",
+    description: "Read the complete contents of a file from the filesystem. " \
+                 "Supports any text file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path:     { type: "string", description: "Absolute path to the file." },
+        encoding: { type: "string", description: "File encoding (default: utf-8).", default: "utf-8" }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "read_file_lines",
+    description: "Read a specific line range from a file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path:       { type: "string",  description: "Absolute path to the file." },
+        start_line: { type: "integer", description: "First line (1-based, default: 1).", default: 1 },
+        end_line:   { type: "integer", description: "Last line inclusive. Omit to read to end." }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "list_directory",
+    description: "List the contents of a directory with file types and sizes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path to the directory." }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "file_info",
+    description: "Get metadata about a file or directory: size, permissions, timestamps, etc.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path to the file or directory." }
+      },
+      required: ["path"]
+    }
+  },
+  {
+    name: "search_files",
+    description: "Search for files by name (regex) or by content (grep-style) within a directory tree.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path:           { type: "string",  description: "Root directory to search." },
+        pattern:        { type: "string",  description: "Regex pattern." },
+        type:           { type: "string",  enum: ["name", "content"], default: "name",
+                          description: "Search by 'name' (default) or 'content'." },
+        file_pattern:   { type: "string",  description: "Glob to restrict content search, e.g. '*.rb'." },
+        max_results:    { type: "integer", description: "Max results (default: 50 / 20)." },
+        include_hidden: { type: "boolean", description: "Include hidden files (default: false).", default: false }
+      },
+      required: ["path", "pattern"]
+    }
+  }
+].freeze
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
+module Tools
+  class Error < StandardError
+    attr_reader :code
+    def initialize(code, msg) = (super(msg); @code = code)
+  end
+
+  def self.require_path(args)
+    raw = args["path"] or raise Error.new(-32_602, "Missing 'path' argument")
+    File.expand_path(raw)
+  end
+
+  def self.read_file(args)
+    path     = require_path(args)
+    encoding = args["encoding"] || "utf-8"
+    raise Error.new(-32_602, "File not found: #{path}") unless File.exist?(path)
+    raise Error.new(-32_602, "Path is a directory: #{path}") if File.directory?(path)
+
+    File.read(path, encoding:)
+  rescue Errno::EACCES
+    raise Error.new(-32_602, "Permission denied: #{args['path']}")
+  end
+
+  def self.read_file_lines(args)
+    path       = require_path(args)
+    start_line = (args["start_line"] || 1).to_i
+    end_line   = args["end_line"] ? args["end_line"].to_i : nil
+    raise Error.new(-32_602, "File not found: #{path}") unless File.file?(path)
+
+    lines    = File.readlines(path, encoding: "utf-8")
+    selected = lines[(start_line - 1)..(end_line ? end_line - 1 : -1)]
+    raise Error.new(-32_602, "Line range out of bounds") if selected.nil? || selected.empty?
+
+    selected.each_with_index.map { |l, i| "#{start_line + i}: #{l.chomp}" }.join("\n")
+  rescue Errno::EACCES
+    raise Error.new(-32_602, "Permission denied: #{args['path']}")
+  end
+
+  def self.list_directory(args)
+    path = require_path(args)
+    raise Error.new(-32_602, "Directory not found: #{path}") unless File.exist?(path)
+    raise Error.new(-32_602, "Not a directory: #{path}") unless File.directory?(path)
+
+    entries = Dir.entries(path).reject { |e| %w[. ..].include?(e) }.sort
+    lines   = entries.map do |entry|
+      full = File.join(path, entry)
+      type = File.directory?(full) ? "DIR " : "FILE"
+      size = File.directory?(full) ? "" : " (#{File.size(full)} bytes)"
+      "#{type}  #{entry}#{size}"
+    end
+    "Contents of #{path}:\n" + lines.join("\n")
+  rescue Errno::EACCES
+    raise Error.new(-32_602, "Permission denied: #{args['path']}")
+  end
+
+  def self.file_info(args)
+    path = require_path(args)
+    raise Error.new(-32_602, "Path not found: #{path}") unless File.exist?(path)
+
+    stat = File.stat(path)
+    info = {
+      path:,
+      type:         File.directory?(path) ? "directory" : "file",
+      size_bytes:   stat.size,
+      permissions:  format("%o", stat.mode),
+      created_at:   stat.ctime.strftime("%Y-%m-%dT%H:%M:%S%z"),
+      modified_at:  stat.mtime.strftime("%Y-%m-%dT%H:%M:%S%z"),
+      readable:     File.readable?(path),
+      writable:     File.writable?(path),
+      executable:   File.executable?(path)
+    }
+    info[:entry_count] = Dir.entries(path).count - 2 if File.directory?(path)
+    info.map { |k, v| "#{k}: #{v}" }.join("\n")
+  rescue Errno::EACCES
+    raise Error.new(-32_602, "Permission denied: #{args['path']}")
+  end
+
+  def self.search_files(args)
+    base    = require_path(args)
+    pattern = args["pattern"] or raise Error.new(-32_602, "Missing 'pattern' argument")
+    raise Error.new(-32_602, "Directory not found: #{base}") unless File.directory?(base)
+
+    args["type"] == "content" ? search_content(base, pattern, args) : search_name(base, pattern, args)
+  end
+
+  def self.search_name(base, pattern, args)
+    max   = (args["max_results"] || 50).to_i
+    regex = Regexp.new(pattern, Regexp::IGNORECASE)
+    results = Dir.glob(File.join(base, "**", "*"))
+                 .select { |p| File.basename(p).match?(regex) }
+                 .reject { |p| !args["include_hidden"] && File.basename(p).start_with?(".") }
+                 .first(max)
+    return "No files matching '#{pattern}' in #{base}" if results.empty?
+
+    "Found #{results.size} file(s):\n" + results.join("\n")
+  rescue RegexpError => e
+    raise Tools::Error.new(-32_602, "Invalid regex: #{e.message}")
+  end
+
+  def self.search_content(base, pattern, args)
+    max   = (args["max_results"] || 20).to_i
+    glob  = args["file_pattern"] ? File.join(base, "**", args["file_pattern"]) : File.join(base, "**", "*")
+    regex = Regexp.new(pattern, Regexp::IGNORECASE)
+    matches = []
+
+    Dir.glob(glob).each do |path|
+      next unless File.file?(path)
+      next if File.size(path) > 10 * 1024 * 1024
+
+      File.foreach(path).with_index(1) do |line, lineno|
+        if line.match?(regex)
+          matches << "#{path}:#{lineno}: #{line.chomp}"
+          break if matches.size >= max
+        end
+      end
+      break if matches.size >= max
+    rescue Errno::EACCES, ArgumentError
+      next
+    end
+
+    return "No content matches for '#{pattern}' in #{base}" if matches.empty?
+
+    "Found #{matches.size} match(es):\n" + matches.join("\n")
+  rescue RegexpError => e
+    raise Tools::Error.new(-32_602, "Invalid regex: #{e.message}")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# JSON-RPC dispatch
+# ---------------------------------------------------------------------------
+
+def respond(id, result)
+  $stdout.puts JSON.generate({ jsonrpc: "2.0", id:, result: })
+  $stdout.flush
+end
+
+def respond_error(id, code, message)
+  $stdout.puts JSON.generate({ jsonrpc: "2.0", id:, error: { code:, message: } })
+  $stdout.flush
+end
+
+def dispatch(msg)
+  id     = msg["id"]
+  method = msg["method"]
+  params = msg["params"] || {}
+
+  # Notifications (no id) — no response
+  return if id.nil?
+
+  result = case method
+           when "initialize"
+             {
+               protocolVersion: PROTOCOL_VERSION,
+               capabilities: { tools: {} },
+               serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+               instructions: "File-system exploration server. All paths must be absolute."
+             }
+           when "ping"
+             {}
+           when "tools/list"
+             { tools: TOOLS }
+           when "tools/call"
+             name      = params["name"] or raise Tools::Error.new(-32_602, "Missing tool name")
+             arguments = params["arguments"] || {}
+             text = case name
+                    when "read_file"       then Tools.read_file(arguments)
+                    when "read_file_lines" then Tools.read_file_lines(arguments)
+                    when "list_directory"  then Tools.list_directory(arguments)
+                    when "file_info"       then Tools.file_info(arguments)
+                    when "search_files"    then Tools.search_files(arguments)
+                    else raise Tools::Error.new(-32_602, "Unknown tool: #{name}")
+                    end
+             { content: [{ type: "text", text: }] }
+           else
+             return respond_error(id, -32_601, "Method not found: #{method}")
+           end
+
+  respond(id, result)
+rescue Tools::Error => e
+  respond_error(id, e.code, e.message)
+rescue => e
+  respond_error(id, -32_603, "Internal error: #{e.message}")
+end
+
+# ---------------------------------------------------------------------------
+# Main loop — read newline-delimited JSON from stdin
+# ---------------------------------------------------------------------------
+
+$stdout.sync = true
+$stderr.sync = true
+
+$stderr.puts "[file-explorer-mcp] started (stdio)"
+
+$stdin.each_line do |line|
+  line.strip!
+  next if line.empty?
+
+  begin
+    msg = JSON.parse(line)
+    dispatch(msg)
+  rescue JSON::ParserError
+    respond_error(nil, -32_700, "Parse error")
+  end
+end
